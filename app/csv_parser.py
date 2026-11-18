@@ -59,6 +59,15 @@ class ParsedCohort:
     n_records: int
 
 
+@dataclass(frozen=True)
+class ParsedEvidence:
+    """事件证据 CSV 解析结果，rows 为 (subject_id, day, event_type)，同患者可多条。"""
+
+    content_sha256: str
+    rows: list[tuple[str, int, str]]
+    n_events: int
+
+
 def _normalize_header(name: str) -> str:
     return name.strip().lstrip("﻿").lower().replace("-", "_").replace(" ", "_")
 
@@ -142,3 +151,102 @@ def parse_csv_bytes(data: bytes) -> ParsedCohort:
         raise CsvValidationError("CSV 没有任何数据行")
 
     return ParsedCohort(content_sha256=content_sha256, rows=rows, n_records=len(rows))
+
+
+# ---------------------------------------------------------------------------
+# 事件证据 CSV
+# ---------------------------------------------------------------------------
+
+# 证据文件必含 subject_id / day；事件列接受以下任一列名
+EVIDENCE_REQUIRED_COLUMNS = ("subject_id", "day")
+EVIDENCE_EVENT_COLUMN_CANDIDATES = ("event", "event_type", "outcome")
+
+# 证据只记录事件（再入院/死亡），随访截止不是事件
+EVENT_ALIASES = {k: v for k, v in OUTCOME_ALIASES.items() if v in ("READMISSION", "DEATH")}
+
+
+def _norm_event(raw: str, line_no: int) -> str:
+    key = raw.strip().upper().replace(" ", "_").replace("-", "_")
+    if key in EVENT_ALIASES:
+        return EVENT_ALIASES[key]
+    if raw.strip() in EVENT_ALIASES:
+        return EVENT_ALIASES[raw.strip()]
+    raise CsvValidationError(
+        f"事件取值非法：{raw!r}，证据只记录 READMISSION/DEATH（或中文 再入院/死亡），"
+        "随访截止不是事件、不应出现在证据中",
+        line=line_no,
+    )
+
+
+def parse_evidence_csv_bytes(data: bytes) -> ParsedEvidence:
+    """解析并全量校验事件证据 CSV 字节。
+
+    与队列 CSV 的差异：同一患者允许出现多条（多次事件）；
+    允许只有表头、没有数据行（全队列无事件时的合法空证据）。
+    """
+    if not data:
+        raise CsvValidationError("上传文件为空")
+    if len(data) > config.MAX_UPLOAD_BYTES:
+        raise CsvValidationError(
+            f"文件超过大小上限 {config.MAX_UPLOAD_BYTES} 字节（实际 {len(data)}）"
+        )
+
+    content_sha256 = hashlib.sha256(data).hexdigest()
+
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CsvValidationError(f"CSV 必须为 UTF-8 编码：{exc}") from exc
+
+    reader = csv.reader(text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise CsvValidationError("CSV 缺少表头") from exc
+
+    normalized = [_normalize_header(h) for h in header]
+    missing = [c for c in EVIDENCE_REQUIRED_COLUMNS if c not in normalized]
+    if missing:
+        raise CsvValidationError(
+            f"CSV 缺少必需列：{', '.join(missing)}；"
+            f"需要 subject_id, day 及事件列 {EVIDENCE_EVENT_COLUMN_CANDIDATES} 之一"
+        )
+    if len(set(normalized)) != len(normalized):
+        raise CsvValidationError(f"CSV 表头存在重复列：{header}")
+    event_cols = [c for c in EVIDENCE_EVENT_COLUMN_CANDIDATES if c in normalized]
+    if not event_cols:
+        raise CsvValidationError(
+            f"CSV 缺少事件列：需要 {EVIDENCE_EVENT_COLUMN_CANDIDATES} 之一"
+        )
+    if len(event_cols) > 1:
+        raise CsvValidationError(f"事件列名歧义：同时出现 {event_cols}，只保留其一")
+    idx = {name: normalized.index(name) for name in EVIDENCE_REQUIRED_COLUMNS}
+    idx["event"] = normalized.index(event_cols[0])
+
+    rows: list[tuple[str, int, str]] = []
+    for line_no, record in enumerate(reader, start=2):
+        if not record or all((cell is None or cell.strip() == "") for cell in record):
+            continue
+        if len(record) != len(header):
+            raise CsvValidationError(
+                f"列数 {len(record)} 与表头列数 {len(header)} 不一致", line=line_no
+            )
+        subject_id = record[idx["subject_id"]].strip()
+        if not subject_id:
+            raise CsvValidationError("subject_id 不能为空", line=line_no)
+
+        raw_day = record[idx["day"]].strip()
+        try:
+            day = int(raw_day)
+        except ValueError as exc:
+            raise CsvValidationError(f"day 必须为整数，实际为 {raw_day!r}", line=line_no) from exc
+        if not 1 <= day <= config.HORIZON_DAYS:
+            raise CsvValidationError(
+                f"day 必须在 1~{config.HORIZON_DAYS} 之间，实际为 {day}", line=line_no
+            )
+
+        event_type = _norm_event(record[idx["event"]], line_no)
+        # 同一患者允许多条（多次事件）；完全重复的行在对账时按集合语义处理
+        rows.append((subject_id, day, event_type))
+
+    return ParsedEvidence(content_sha256=content_sha256, rows=rows, n_events=len(rows))

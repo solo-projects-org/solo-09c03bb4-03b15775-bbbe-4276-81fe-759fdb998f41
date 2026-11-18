@@ -29,6 +29,7 @@ def app_client(tmp_path, monkeypatch):
         "app.config",
         "app.database",
         "app.analysis",
+        "app.reconcile",
         "app.csv_parser",
         "app.services",
         "app.schemas",

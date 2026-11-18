@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from . import config
+from .reconcile import reconcile
 
 # 全局写锁：上传受理与分析重算均需持有
 write_lock = threading.RLock()
@@ -120,6 +121,60 @@ SCHEMA_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_revision ON records(revision);",
     "CREATE INDEX IF NOT EXISTS idx_days_revision ON analysis_days(revision);",
+    # 事件证据批次：针对某一队列修订上传的完整事件 CSV
+    """
+    CREATE TABLE IF NOT EXISTS evidence_batches (
+        batch_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision       INTEGER NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        n_events       INTEGER NOT NULL,
+        status         TEXT NOT NULL CHECK (status IN ('ACTIVE','SUPERSEDED')),
+        uploaded_at    TEXT NOT NULL,
+        superseded_at  TEXT,
+        FOREIGN KEY (revision) REFERENCES revisions(revision) ON DELETE CASCADE
+    );
+    """,
+    # 证据事件明细：同一患者可有多条
+    """
+    CREATE TABLE IF NOT EXISTS evidence_events (
+        batch_id   INTEGER NOT NULL,
+        subject_id TEXT NOT NULL,
+        day        INTEGER NOT NULL CHECK (day BETWEEN 1 AND 30),
+        event_type TEXT NOT NULL CHECK (event_type IN ('READMISSION','DEATH')),
+        FOREIGN KEY (batch_id) REFERENCES evidence_batches(batch_id) ON DELETE CASCADE
+    );
+    """,
+    # 对账结论：每批次在受理事务内同步对账并落库，一份批次一份结论
+    """
+    CREATE TABLE IF NOT EXISTS reconciliations (
+        batch_id    INTEGER PRIMARY KEY,
+        revision    INTEGER NOT NULL,
+        status      TEXT NOT NULL CHECK (status IN ('PASSED','FAILED')),
+        n_subjects  INTEGER NOT NULL,
+        n_issues    INTEGER NOT NULL,
+        computed_at TEXT NOT NULL,
+        FOREIGN KEY (batch_id) REFERENCES evidence_batches(batch_id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reconciliation_issues (
+        batch_id       INTEGER NOT NULL,
+        subject_id     TEXT NOT NULL,
+        issue_type     TEXT NOT NULL CHECK (issue_type IN
+                         ('AMBIGUOUS_FIRST_DAY','EVENT_NOT_RECORDED',
+                          'MISSING_EVIDENCE','UNKNOWN_SUBJECT')),
+        message        TEXT NOT NULL,
+        cohort_day     INTEGER,
+        cohort_outcome TEXT,
+        evidence_day   INTEGER,
+        evidence_event TEXT,
+        FOREIGN KEY (batch_id) REFERENCES evidence_batches(batch_id) ON DELETE CASCADE
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_evidence_batches_revision "
+    "ON evidence_batches(revision);",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_events_batch ON evidence_events(batch_id);",
+    "CREATE INDEX IF NOT EXISTS idx_recon_issues_batch ON reconciliation_issues(batch_id);",
 ]
 
 
@@ -206,6 +261,13 @@ def accept_revision(
             conn.execute(
                 "UPDATE analyses SET status = 'SUPERSEDED', finished_at = ?, "
                 "error = '修订已被新版本取代' WHERE revision = ? AND status = 'PENDING';",
+                (now, prev_current),
+            )
+            # 受理新版队列：旧修订的有效证据批次立即撤销，旧核对资格同时失效；
+            # 新修订必须重新上传证据并对账，绝不借用旧版证据或结论
+            conn.execute(
+                "UPDATE evidence_batches SET status = 'SUPERSEDED', superseded_at = ? "
+                "WHERE revision = ? AND status = 'ACTIVE';",
                 (now, prev_current),
             )
 
@@ -349,9 +411,221 @@ def pending_revisions() -> list[int]:
         return [r[0] for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# 事件证据：受理、对账与查询
+# ---------------------------------------------------------------------------
+
+def _load_reconciliation(
+    conn: sqlite3.Connection, batch_id: int
+) -> tuple[Optional[dict], list[dict]]:
+    recon = conn.execute(
+        "SELECT * FROM reconciliations WHERE batch_id = ?;", (batch_id,)
+    ).fetchone()
+    issues = conn.execute(
+        "SELECT subject_id, issue_type, message, cohort_day, cohort_outcome, "
+        "evidence_day, evidence_event FROM reconciliation_issues "
+        "WHERE batch_id = ? ORDER BY subject_id, issue_type;",
+        (batch_id,),
+    ).fetchall()
+    return (
+        dict(recon) if recon is not None else None,
+        [dict(i) for i in issues],
+    )
+
+
+def accept_evidence(
+    content_sha256: str,
+    events: list[tuple[str, int, str]],
+    expected_revision: Optional[int] = None,
+) -> dict:
+    """在单一 IMMEDIATE 事务内受理事件证据并同步完成对账。
+
+    - 证据只针对**现行**修订；``expected_revision`` 非空且与现行不一致时拒收，
+      防止"上传期间队列被替换"导致证据挂错版本。
+    - 同版同内容（对现行 ACTIVE 批次 SHA-256 相同）重送：幂等，
+      直接返回既有批次与对账结论，不做任何写入。
+    - 内容不同：旧 ACTIVE 批次立即置 SUPERSEDED（旧核对资格撤销），
+      新批次写入 ACTIVE 并在同事务内完成逐人对账、落库结论与问题清单。
+    """
+    now = _utcnow()
+    with write_lock, immediate_transaction() as conn:
+        current = current_revision_no(conn)
+        if current is None:
+            raise NoCurrentRevision("尚无任何队列修订被受理，无法上传事件证据。")
+        if expected_revision is not None and expected_revision != current:
+            raise RevisionConflict(
+                f"证据针对修订 {expected_revision}，但现行修订为 {current}；"
+                "队列已更新，请按新现行队列重新上传证据。",
+                current_revision=current,
+            )
+
+        active = conn.execute(
+            "SELECT * FROM evidence_batches WHERE revision = ? AND status = 'ACTIVE';",
+            (current,),
+        ).fetchone()
+        if active is not None and active["content_sha256"] == content_sha256:
+            recon, issues = _load_reconciliation(conn, active["batch_id"])
+            return {
+                "accepted": False,
+                "idempotent": True,
+                "revision": current,
+                "batch": dict(active),
+                "reconciliation": recon,
+                "issues": issues,
+            }
+
+        if active is not None:
+            # 替换证据：立即撤销旧批次核对资格
+            conn.execute(
+                "UPDATE evidence_batches SET status = 'SUPERSEDED', superseded_at = ? "
+                "WHERE batch_id = ?;",
+                (now, active["batch_id"]),
+            )
+
+        cur = conn.execute(
+            "INSERT INTO evidence_batches (revision, content_sha256, n_events, status, "
+            "uploaded_at, superseded_at) VALUES (?, ?, ?, 'ACTIVE', ?, NULL);",
+            (current, content_sha256, len(events), now),
+        )
+        batch_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO evidence_events (batch_id, subject_id, day, event_type) "
+            "VALUES (?, ?, ?, ?);",
+            [(batch_id, sid, day, etype) for sid, day, etype in events],
+        )
+        # 同事务内读取现行队列记录并对账：结论严格绑定该修订，不借用任何旧版数据
+        cohort_rows = conn.execute(
+            "SELECT subject_id, day, outcome FROM records WHERE revision = ? "
+            "ORDER BY subject_id;",
+            (current,),
+        ).fetchall()
+        found = reconcile(cohort_rows, events)
+        recon_status = "PASSED" if not found else "FAILED"
+        conn.execute(
+            "INSERT INTO reconciliations (batch_id, revision, status, n_subjects, "
+            "n_issues, computed_at) VALUES (?, ?, ?, ?, ?, ?);",
+            (batch_id, current, recon_status, len(cohort_rows), len(found), now),
+        )
+        conn.executemany(
+            "INSERT INTO reconciliation_issues (batch_id, subject_id, issue_type, "
+            "message, cohort_day, cohort_outcome, evidence_day, evidence_event) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            [
+                (
+                    batch_id,
+                    i.subject_id,
+                    i.issue_type,
+                    i.message,
+                    i.cohort_day,
+                    i.cohort_outcome,
+                    i.evidence_day,
+                    i.evidence_event,
+                )
+                for i in found
+            ],
+        )
+        batch = conn.execute(
+            "SELECT * FROM evidence_batches WHERE batch_id = ?;", (batch_id,)
+        ).fetchone()
+        recon, issues = _load_reconciliation(conn, batch_id)
+        return {
+            "accepted": True,
+            "idempotent": False,
+            "revision": current,
+            "batch": dict(batch),
+            "reconciliation": recon,
+            "issues": issues,
+        }
+
+
+def get_active_evidence(revision: int) -> Optional[dict]:
+    """现行有效（ACTIVE）证据批次及其对账结论；无有效批次返回 None。"""
+    with read_session() as conn:
+        batch = conn.execute(
+            "SELECT * FROM evidence_batches WHERE revision = ? AND status = 'ACTIVE';",
+            (revision,),
+        ).fetchone()
+        if batch is None:
+            return None
+        recon, issues = _load_reconciliation(conn, batch["batch_id"])
+        return {"batch": dict(batch), "reconciliation": recon, "issues": issues}
+
+
+def list_evidence_batches(revision: int) -> list[dict]:
+    """某修订的全部证据批次（含已撤销），附各自对账状态，供审计留痕。"""
+    with read_session() as conn:
+        rows = conn.execute(
+            "SELECT b.*, r.status AS reconciliation_status, r.n_issues AS "
+            "reconciliation_n_issues FROM evidence_batches b "
+            "LEFT JOIN reconciliations r ON r.batch_id = b.batch_id "
+            "WHERE b.revision = ? ORDER BY b.batch_id DESC;",
+            (revision,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def latest_evidence_status(revision: int) -> Optional[str]:
+    """某修订最近一次证据批次的对账状态（无论批次是否仍有效）；无证据返回 None。"""
+    with read_session() as conn:
+        row = conn.execute(
+            "SELECT r.status FROM evidence_batches b "
+            "JOIN reconciliations r ON r.batch_id = b.batch_id "
+            "WHERE b.revision = ? ORDER BY b.batch_id DESC LIMIT 1;",
+            (revision,),
+        ).fetchone()
+        return row[0] if row else None
+
+
+def get_serving_status() -> dict:
+    """供数状态：仅"现行修订分析完成 + 有效证据对账通过"时可供数。"""
+    with read_session() as conn:
+        current = current_revision_no(conn)
+        if current is None:
+            return {
+                "revision": None,
+                "analysis_status": None,
+                "evidence_status": "NONE",
+                "servable": False,
+                "message": "尚无任何修订被受理。",
+            }
+        row = conn.execute(
+            "SELECT status FROM analyses WHERE revision = ?;", (current,)
+        ).fetchone()
+        analysis_status = row["status"] if row else None
+        ev = conn.execute(
+            "SELECT r.status AS recon_status, r.n_issues FROM evidence_batches b "
+            "JOIN reconciliations r ON r.batch_id = b.batch_id "
+            "WHERE b.revision = ? AND b.status = 'ACTIVE';",
+            (current,),
+        ).fetchone()
+        evidence_status = "NONE" if ev is None else ev["recon_status"]
+        servable = analysis_status == "COMPLETED" and evidence_status == "PASSED"
+        if servable:
+            message = "证据核对通过且分析完成，现行风险结果可供数。"
+        elif analysis_status != "COMPLETED":
+            message = f"现行修订 {current} 分析状态为 {analysis_status}，结论暂不可供数。"
+        elif evidence_status == "NONE":
+            message = f"现行修订 {current} 尚无有效事件证据，风险结果不可供数。"
+        else:
+            message = (
+                f"事件证据对账未通过（{ev['n_issues']} 个逐人问题），风险结果不可供数。"
+            )
+        return {
+            "revision": current,
+            "analysis_status": analysis_status,
+            "evidence_status": evidence_status,
+            "servable": servable,
+            "message": message,
+        }
+
+
 class RevisionConflict(Exception):
     """版本冲突（同版异内容 / 非递增版号 / 修订已失效）。"""
 
     def __init__(self, message: str, current_revision: Optional[int] = None):
         super().__init__(message)
         self.current_revision = current_revision
+
+
+class NoCurrentRevision(Exception):
+    """尚无任何队列修订被受理。"""
